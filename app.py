@@ -2,13 +2,15 @@
 """
 NomadPay Backend API - Production Ready Flask Application
 Complete financial platform backend with security, authentication, and admin features
+
+Note: Uses Python's built-in sqlite3 module (no external dependency required)
 """
 
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
-import sqlite3
+import sqlite3  # Built-in Python module - no pip install required
 import os
 import logging
 from datetime import datetime, timedelta
@@ -46,156 +48,171 @@ logger = logging.getLogger(__name__)
 # Database initialization
 def init_db():
     """Initialize the database with all required tables"""
-    conn = sqlite3.connect(Config.DATABASE_URL)
-    cursor = conn.cursor()
-    
-    # Users table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT DEFAULT 'user',
-            status TEXT DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Wallets table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS wallets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            currency TEXT NOT NULL,
-            balance DECIMAL(15,2) DEFAULT 0.00,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id),
-            UNIQUE(user_id, currency)
-        )
-    ''')
-    
-    # Transactions table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            amount DECIMAL(15,2) NOT NULL,
-            currency TEXT NOT NULL,
-            recipient TEXT,
-            status TEXT DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    
-    # QR codes table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS qr_codes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            wallet_address TEXT NOT NULL,
-            amount DECIMAL(15,2) DEFAULT 0.00,
-            currency TEXT DEFAULT 'USD',
-            status TEXT DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            expires_at TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    
-    # Security logs table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS security_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            event_type TEXT NOT NULL,
-            ip_address TEXT,
-            user_agent TEXT,
-            severity TEXT DEFAULT 'info',
-            details TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    
-    # Audit logs table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_user TEXT NOT NULL,
-            action TEXT NOT NULL,
-            resource_type TEXT,
-            resource_id TEXT,
-            details TEXT,
-            ip_address TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Refresh tokens table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS refresh_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            token_hash TEXT NOT NULL,
-            expires_at TIMESTAMP NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            revoked BOOLEAN DEFAULT FALSE,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    
-    # Rate limiting table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS rate_limits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ip_address TEXT NOT NULL,
-            endpoint TEXT NOT NULL,
-            requests INTEGER DEFAULT 1,
-            window_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(ip_address, endpoint)
-        )
-    ''')
-    
-    # Create default admin user if not exists
-    cursor.execute('SELECT id FROM users WHERE email = ?', ('admin@nomadpay.io',))
-    if not cursor.fetchone():
-        admin_password = generate_password_hash('admin123')
-        cursor.execute('''
-            INSERT INTO users (email, password_hash, role, status)
-            VALUES (?, ?, ?, ?)
-        ''', ('admin@nomadpay.io', admin_password, 'admin', 'active'))
+    try:
+        conn = sqlite3.connect(Config.DATABASE_URL)
+        cursor = conn.cursor()
         
-        # Create default wallets for admin
-        admin_id = cursor.lastrowid
-        currencies = ['USD', 'EUR', 'BTC', 'ETH']
-        for currency in currencies:
+        # Users table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT DEFAULT 'user',
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Wallets table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS wallets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                balance DECIMAL(15,2) DEFAULT 0.00,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id),
+                UNIQUE(user_id, currency)
+            )
+        ''')
+        
+        # Transactions table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                amount DECIMAL(15,2) NOT NULL,
+                currency TEXT NOT NULL,
+                recipient TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ''')
+        
+        # QR codes table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS qr_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                wallet_address TEXT NOT NULL,
+                amount DECIMAL(15,2) DEFAULT 0.00,
+                currency TEXT DEFAULT 'USD',
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ''')
+        
+        # Security logs table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS security_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                event_type TEXT NOT NULL,
+                ip_address TEXT,
+                user_agent TEXT,
+                severity TEXT DEFAULT 'info',
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ''')
+        
+        # Audit logs table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_user TEXT NOT NULL,
+                action TEXT NOT NULL,
+                resource_type TEXT,
+                resource_id TEXT,
+                details TEXT,
+                ip_address TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Refresh tokens table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                revoked BOOLEAN DEFAULT FALSE,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ''')
+        
+        # Rate limiting table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_address TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                requests INTEGER DEFAULT 1,
+                window_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(ip_address, endpoint)
+            )
+        ''')
+        
+        # Create default admin user if not exists
+        cursor.execute('SELECT id FROM users WHERE email = ?', ('admin@nomadpay.io',))
+        if not cursor.fetchone():
+            admin_password = generate_password_hash('admin123')
             cursor.execute('''
-                INSERT INTO wallets (user_id, currency, balance)
-                VALUES (?, ?, ?)
-            ''', (admin_id, currency, 1000.00 if currency in ['USD', 'EUR'] else 0.1))
-    
-    conn.commit()
-    conn.close()
-    logger.info("Database initialized successfully")
+                INSERT INTO users (email, password_hash, role, status)
+                VALUES (?, ?, ?, ?)
+            ''', ('admin@nomadpay.io', admin_password, 'admin', 'active'))
+            
+            # Create default wallets for admin
+            admin_id = cursor.lastrowid
+            currencies = ['USD', 'EUR', 'BTC', 'ETH']
+            for currency in currencies:
+                cursor.execute('''
+                    INSERT INTO wallets (user_id, currency, balance)
+                    VALUES (?, ?, ?)
+                ''', (admin_id, currency, 1000.00 if currency in ['USD', 'EUR'] else 0.1))
+        
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized successfully")
+        
+    except sqlite3.Error as e:
+        logger.error(f"Database initialization error: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during database initialization: {e}")
+        raise
 
 # Database helper functions
 def get_db():
     """Get database connection"""
     if 'db' not in g:
-        g.db = sqlite3.connect(Config.DATABASE_URL)
-        g.db.row_factory = sqlite3.Row
+        try:
+            g.db = sqlite3.connect(Config.DATABASE_URL)
+            g.db.row_factory = sqlite3.Row
+        except sqlite3.Error as e:
+            logger.error(f"Database connection error: {e}")
+            raise
     return g.db
 
 def close_db(error):
     """Close database connection"""
     db = g.pop('db', None)
     if db is not None:
-        db.close()
+        try:
+            db.close()
+        except sqlite3.Error as e:
+            logger.error(f"Database close error: {e}")
 
 @app.teardown_appcontext
 def close_db_handler(error):
@@ -296,12 +313,15 @@ def generate_tokens(user_id: int) -> Dict[str, str]:
     
     # Store refresh token hash
     token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
-    db = get_db()
-    db.execute('''
-        INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-        VALUES (?, ?, ?)
-    ''', (user_id, token_hash, now + Config.JWT_REFRESH_TOKEN_EXPIRES))
-    db.commit()
+    try:
+        db = get_db()
+        db.execute('''
+            INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
+            VALUES (?, ?, ?)
+        ''', (user_id, token_hash, now + Config.JWT_REFRESH_TOKEN_EXPIRES))
+        db.commit()
+    except Exception as e:
+        logger.error(f"Failed to store refresh token: {e}")
     
     return {
         'access_token': access_token,
@@ -352,14 +372,18 @@ def admin_required(f):
     """Decorator to require admin role"""
     @wraps(f)
     def decorated(*args, **kwargs):
-        db = get_db()
-        user = db.execute('SELECT role FROM users WHERE id = ?', (g.current_user_id,)).fetchone()
-        
-        if not user or user['role'] != 'admin':
-            log_security_event('unauthorized_admin_access', 'high', g.current_user_id, 'Non-admin attempted admin access')
-            return jsonify({'success': False, 'message': 'Admin access required'}), 403
-        
-        return f(*args, **kwargs)
+        try:
+            db = get_db()
+            user = db.execute('SELECT role FROM users WHERE id = ?', (g.current_user_id,)).fetchone()
+            
+            if not user or user['role'] != 'admin':
+                log_security_event('unauthorized_admin_access', 'high', g.current_user_id, 'Non-admin attempted admin access')
+                return jsonify({'success': False, 'message': 'Admin access required'}), 403
+            
+            return f(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Admin check error: {e}")
+            return jsonify({'success': False, 'message': 'Authorization check failed'}), 500
     
     return decorated
 
@@ -392,12 +416,27 @@ def add_security_headers(response):
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    return jsonify({
-        'success': True,
-        'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat(),
-        'version': '2.0.0'
-    })
+    try:
+        # Test database connection
+        db = get_db()
+        db.execute('SELECT 1').fetchone()
+        
+        return jsonify({
+            'success': True,
+            'status': 'healthy',
+            'timestamp': datetime.utcnow().isoformat(),
+            'version': '2.0.0',
+            'database': 'connected'
+        })
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({
+            'success': False,
+            'status': 'unhealthy',
+            'timestamp': datetime.utcnow().isoformat(),
+            'version': '2.0.0',
+            'error': 'Database connection failed'
+        }), 500
 
 # Authentication endpoints
 @app.route('/api/auth/register', methods=['POST'])
@@ -1006,7 +1045,11 @@ def internal_error(error):
 
 # Initialize database on startup
 if __name__ == '__main__':
-    init_db()
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=Config.DEBUG)
+    try:
+        init_db()
+        port = int(os.environ.get('PORT', 5000))
+        app.run(host='0.0.0.0', port=port, debug=Config.DEBUG)
+    except Exception as e:
+        logger.error(f"Application startup failed: {e}")
+        raise
 
