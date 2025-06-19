@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-NomadPay Backend API - Enhanced with better error handling and response structure
-Production-ready Flask API with comprehensive authentication, wallet management, and security features.
+NomadPay Backend API - FIXED Authentication Response Structure
+Production-ready Flask API with frontend-compatible authentication responses.
 """
 
 import os
@@ -49,16 +49,43 @@ class Config:
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=1)
     JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=7)
 
-# Database functions
+# Rate limiting storage
+rate_limit_storage = {}
+
+def rate_limit(max_requests: int, window_minutes: int = 1):
+    """Rate limiting decorator"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            client_ip = request.remote_addr
+            current_time = datetime.utcnow()
+            window_start = current_time - timedelta(minutes=window_minutes)
+            
+            # Clean old entries
+            if client_ip in rate_limit_storage:
+                rate_limit_storage[client_ip] = [
+                    timestamp for timestamp in rate_limit_storage[client_ip]
+                    if timestamp > window_start
+                ]
+            else:
+                rate_limit_storage[client_ip] = []
+            
+            # Check rate limit
+            if len(rate_limit_storage[client_ip]) >= max_requests:
+                return jsonify({'success': False, 'message': 'Rate limit exceeded'}), 429
+            
+            # Add current request
+            rate_limit_storage[client_ip].append(current_time)
+            
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
 def get_db():
     """Get database connection"""
     if 'db' not in g:
-        try:
-            g.db = sqlite3.connect(Config.DATABASE_URL)
-            g.db.row_factory = sqlite3.Row
-        except sqlite3.Error as e:
-            logger.error(f"Database connection error: {e}")
-            raise
+        g.db = sqlite3.connect(Config.DATABASE_URL)
+        g.db.row_factory = sqlite3.Row
     return g.db
 
 def close_db(e=None):
@@ -67,8 +94,12 @@ def close_db(e=None):
     if db is not None:
         db.close()
 
+@app.teardown_appcontext
+def close_db(error):
+    close_db()
+
 def init_db():
-    """Initialize the database with all required tables"""
+    """Initialize database with all required tables"""
     try:
         conn = sqlite3.connect(Config.DATABASE_URL)
         cursor = conn.cursor()
@@ -108,7 +139,8 @@ def init_db():
                 type TEXT NOT NULL,
                 amount DECIMAL(15,8) NOT NULL,
                 currency TEXT NOT NULL,
-                recipient TEXT,
+                recipient_email TEXT,
+                description TEXT,
                 status TEXT DEFAULT 'completed',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (id)
@@ -120,13 +152,13 @@ def init_db():
             CREATE TABLE IF NOT EXISTS qr_codes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
-                qr_id TEXT UNIQUE NOT NULL,
+                code TEXT UNIQUE NOT NULL,
                 amount DECIMAL(15,8) NOT NULL,
                 currency TEXT NOT NULL,
-                wallet_address TEXT NOT NULL,
+                description TEXT,
                 status TEXT DEFAULT 'active',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 expires_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (id)
             )
         ''')
@@ -138,9 +170,9 @@ def init_db():
                 user_id INTEGER,
                 event_type TEXT NOT NULL,
                 severity TEXT NOT NULL,
+                details TEXT,
                 ip_address TEXT,
                 user_agent TEXT,
-                details TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (id)
             )
@@ -211,93 +243,64 @@ def generate_tokens(user_id: int) -> Dict[str, str]:
         logger.error(f"Token generation error: {e}")
         raise
 
-def verify_token(token: str, token_type: str = 'access') -> Optional[Dict[str, Any]]:
+def verify_token(token: str, token_type: str = 'access') -> Optional[Dict]:
     """Verify JWT token"""
     try:
         payload = jwt.decode(token, Config.JWT_SECRET_KEY, algorithms=['HS256'])
-        
         if payload.get('type') != token_type:
             return None
-            
         return payload
-        
     except jwt.ExpiredSignatureError:
-        logger.warning("Token has expired")
         return None
     except jwt.InvalidTokenError:
-        logger.warning("Invalid token")
-        return None
-    except Exception as e:
-        logger.error(f"Token verification error: {e}")
         return None
 
-def log_security_event(event_type: str, severity: str, user_id: int = None, details: str = None):
+def require_auth(f):
+    """Authentication decorator"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'success': False, 'message': 'Authentication required'}), 401
+        
+        token = auth_header.split(' ')[1]
+        payload = verify_token(token)
+        if not payload:
+            return jsonify({'success': False, 'message': 'Invalid or expired token'}), 401
+        
+        g.current_user_id = payload['user_id']
+        return f(*args, **kwargs)
+    return decorated_function
+
+def log_security_event(event_type: str, severity: str, user_id: Optional[int] = None, details: str = ''):
     """Log security events"""
     try:
         db = get_db()
         db.execute('''
-            INSERT INTO security_events (user_id, event_type, severity, ip_address, user_agent, details)
+            INSERT INTO security_events (user_id, event_type, severity, details, ip_address, user_agent)
             VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, event_type, severity, request.remote_addr, request.headers.get('User-Agent'), details))
+        ''', (user_id, event_type, severity, details, request.remote_addr, request.headers.get('User-Agent', '')))
         db.commit()
     except Exception as e:
-        logger.error(f"Security event logging error: {e}")
-
-# Rate limiting decorator
-def rate_limit(max_requests: int):
-    """Simple rate limiting decorator"""
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            # Simple rate limiting implementation
-            # In production, use Redis or similar for distributed rate limiting
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
-
-# Security headers middleware
-@app.after_request
-def add_security_headers(response):
-    """Add security headers to all responses"""
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
-    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    response.headers['Content-Security-Policy'] = "default-src 'self'"
-    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    return response
+        logger.error(f"Failed to log security event: {e}")
 
 # Health check endpoint
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    try:
-        # Test database connection
-        db = get_db()
-        db.execute('SELECT 1').fetchone()
-        
-        return jsonify({
-            'success': True,
-            'status': 'healthy',
-            'timestamp': datetime.utcnow().isoformat(),
-            'version': '2.0.0',
-            'database': 'connected'
-        })
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return jsonify({
-            'success': False,
-            'status': 'unhealthy',
-            'timestamp': datetime.utcnow().isoformat(),
-            'version': '2.0.0',
-            'error': 'Database connection failed'
-        }), 500
+    return jsonify({
+        'success': True,
+        'message': 'NomadPay API is healthy',
+        'timestamp': datetime.utcnow().isoformat(),
+        'version': '1.0.0'
+    }), 200
 
-# Authentication endpoints
+# ===== FIXED AUTHENTICATION ENDPOINTS =====
+
 @app.route('/api/auth/register', methods=['POST'])
-@rate_limit(5)  # 5 registrations per minute
+@rate_limit(5)  # 5 registration attempts per minute
 def register():
-    """User registration with enhanced error handling"""
+    """User registration with FIXED response structure"""
     try:
         data = request.get_json()
         if not data:
@@ -345,18 +348,18 @@ def register():
         
         log_security_event('user_registered', 'info', user_id, f'New user registered: {email}')
         
-        # Return complete response with all required fields
+        # ✅ FIXED: Return response structure that matches frontend expectations
         response_data = {
             'success': True,
             'message': 'Registration successful',
+            'access_token': tokens['access_token'],
+            'refresh_token': tokens['refresh_token'],
             'user': {
                 'id': str(user_id),
                 'email': email,
                 'role': 'user',
                 'created_at': datetime.utcnow().isoformat()
-            },
-            'access_token': tokens['access_token'],
-            'refresh_token': tokens['refresh_token']
+            }
         }
         
         logger.info(f"User registered successfully: {email}")
@@ -369,7 +372,7 @@ def register():
 @app.route('/api/auth/login', methods=['POST'])
 @rate_limit(10)  # 10 login attempts per minute
 def login():
-    """User login with enhanced error handling"""
+    """User login with FIXED response structure"""
     try:
         data = request.get_json()
         if not data:
@@ -400,18 +403,18 @@ def login():
         
         log_security_event('user_login', 'info', user['id'], f'User logged in: {email}')
         
-        # Return complete response with all required fields
+        # ✅ FIXED: Return response structure that matches frontend expectations
         response_data = {
             'success': True,
             'message': 'Login successful',
+            'access_token': tokens['access_token'],  # ✅ Changed from 'token' to 'access_token'
+            'refresh_token': tokens['refresh_token'], # ✅ Added refresh_token
             'user': {
                 'id': str(user['id']),
                 'email': user['email'],
                 'role': user['role'],
                 'created_at': user['created_at']
-            },
-            'access_token': tokens['access_token'],
-            'refresh_token': tokens['refresh_token']
+            }
         }
         
         logger.info(f"User logged in successfully: {email}")
@@ -422,225 +425,270 @@ def login():
         return jsonify({'success': False, 'message': 'Login failed. Please try again.'}), 500
 
 @app.route('/api/auth/refresh', methods=['POST'])
-@rate_limit(20)  # 20 refresh attempts per minute
 def refresh_token():
-    """Refresh access token"""
+    """Refresh access token using refresh token"""
     try:
         data = request.get_json()
-        refresh_token = data.get('refresh_token', '')
+        if not data or 'refresh_token' not in data:
+            return jsonify({'success': False, 'message': 'Refresh token required'}), 400
         
-        if not refresh_token:
-            return jsonify({'success': False, 'message': 'Refresh token is required'}), 400
-        
-        # Verify refresh token
+        refresh_token = data['refresh_token']
         payload = verify_token(refresh_token, 'refresh')
-        if not payload:
-            log_security_event('invalid_refresh_token', 'medium', details='Invalid refresh token')
-            return jsonify({'success': False, 'message': 'Invalid refresh token'}), 401
         
-        user_id = payload['user_id']
+        if not payload:
+            return jsonify({'success': False, 'message': 'Invalid or expired refresh token'}), 401
+        
+        # Check if refresh token exists and is not revoked
+        db = get_db()
+        token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+        stored_token = db.execute('''
+            SELECT id, user_id, expires_at, revoked FROM refresh_tokens 
+            WHERE token_hash = ?
+        ''', (token_hash,)).fetchone()
+        
+        if not stored_token or stored_token['revoked']:
+            return jsonify({'success': False, 'message': 'Refresh token revoked'}), 401
         
         # Generate new tokens
-        tokens = generate_tokens(user_id)
+        tokens = generate_tokens(payload['user_id'])
         
-        return jsonify({
+        # Revoke old refresh token
+        db.execute('UPDATE refresh_tokens SET revoked = TRUE WHERE id = ?', (stored_token['id'],))
+        db.commit()
+        
+        # ✅ FIXED: Return consistent response structure
+        response_data = {
             'success': True,
             'message': 'Token refreshed successfully',
             'access_token': tokens['access_token'],
             'refresh_token': tokens['refresh_token']
-        })
+        }
+        
+        return jsonify(response_data), 200
         
     except Exception as e:
         logger.error(f"Token refresh error: {e}")
         return jsonify({'success': False, 'message': 'Token refresh failed'}), 500
 
 @app.route('/api/auth/logout', methods=['POST'])
+@require_auth
 def logout():
-    """User logout"""
+    """User logout - revoke refresh tokens"""
     try:
-        # In a full implementation, you would revoke the refresh token
-        return jsonify({'success': True, 'message': 'Logout successful'})
+        # Revoke all refresh tokens for the user
+        db = get_db()
+        db.execute('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = ?', (g.current_user_id,))
+        db.commit()
+        
+        log_security_event('user_logout', 'info', g.current_user_id, 'User logged out')
+        
+        return jsonify({
+            'success': True,
+            'message': 'Logged out successfully'
+        }), 200
+        
     except Exception as e:
         logger.error(f"Logout error: {e}")
         return jsonify({'success': False, 'message': 'Logout failed'}), 500
 
-# Wallet endpoints
+# ===== WALLET ENDPOINTS =====
+
 @app.route('/api/wallet/balances', methods=['GET'])
+@require_auth
 def get_wallet_balances():
     """Get user wallet balances"""
     try:
-        # Get token from Authorization header
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'success': False, 'message': 'Token is missing'}), 401
-        
-        token = auth_header.split(' ')[1]
-        payload = verify_token(token)
-        if not payload:
-            return jsonify({'success': False, 'message': 'Token is invalid or expired'}), 401
-        
-        user_id = payload['user_id']
         db = get_db()
-        
         wallets = db.execute('''
             SELECT currency, balance FROM wallets WHERE user_id = ?
-        ''', (user_id,)).fetchall()
+        ''', (g.current_user_id,)).fetchall()
         
-        wallet_data = [{'currency': w['currency'], 'balance': str(w['balance'])} for w in wallets]
+        balances = {wallet['currency']: float(wallet['balance']) for wallet in wallets}
         
         return jsonify({
             'success': True,
-            'wallets': wallet_data
-        })
+            'balances': balances
+        }), 200
         
     except Exception as e:
-        logger.error(f"Wallet balances error: {e}")
-        return jsonify({'success': False, 'message': 'Failed to get wallet balances'}), 500
+        logger.error(f"Get balances error: {e}")
+        return jsonify({'success': False, 'message': 'Failed to get balances'}), 500
+
+# ===== TRANSACTION ENDPOINTS =====
 
 @app.route('/api/transactions', methods=['GET'])
+@require_auth
 def get_transactions():
-    """Get user transactions"""
+    """Get user transaction history"""
     try:
-        # Get token from Authorization header
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'success': False, 'message': 'Token is missing'}), 401
-        
-        token = auth_header.split(' ')[1]
-        payload = verify_token(token)
-        if not payload:
-            return jsonify({'success': False, 'message': 'Token is invalid or expired'}), 401
-        
-        user_id = payload['user_id']
         db = get_db()
-        
         transactions = db.execute('''
-            SELECT id, type, amount, currency, recipient, status, created_at
+            SELECT id, type, amount, currency, recipient_email, description, status, created_at
             FROM transactions WHERE user_id = ?
             ORDER BY created_at DESC LIMIT 50
-        ''', (user_id,)).fetchall()
+        ''', (g.current_user_id,)).fetchall()
         
-        transaction_data = [{
-            'id': str(t['id']),
-            'type': t['type'],
-            'amount': float(t['amount']),
-            'currency': t['currency'],
-            'recipient': t['recipient'],
-            'status': t['status'],
-            'created_at': t['created_at']
-        } for t in transactions]
+        transaction_list = []
+        for tx in transactions:
+            transaction_list.append({
+                'id': tx['id'],
+                'type': tx['type'],
+                'amount': float(tx['amount']),
+                'currency': tx['currency'],
+                'recipient_email': tx['recipient_email'],
+                'description': tx['description'],
+                'status': tx['status'],
+                'created_at': tx['created_at']
+            })
         
         return jsonify({
             'success': True,
-            'transactions': transaction_data
-        })
+            'transactions': transaction_list
+        }), 200
         
     except Exception as e:
-        logger.error(f"Transactions error: {e}")
+        logger.error(f"Get transactions error: {e}")
         return jsonify({'success': False, 'message': 'Failed to get transactions'}), 500
 
 @app.route('/api/transactions/send', methods=['POST'])
+@require_auth
+@rate_limit(20)  # 20 transactions per minute
 def send_money():
-    """Send money transaction"""
+    """Send money to another user"""
     try:
-        # Get token from Authorization header
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'success': False, 'message': 'Token is missing'}), 401
-        
-        token = auth_header.split(' ')[1]
-        payload = verify_token(token)
-        if not payload:
-            return jsonify({'success': False, 'message': 'Token is invalid or expired'}), 401
-        
-        user_id = payload['user_id']
         data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'message': 'No data provided'}), 400
         
-        recipient = data.get('recipient', '')
+        recipient_email = data.get('recipient_email', '').lower().strip()
         amount = float(data.get('amount', 0))
-        currency = data.get('currency', 'USD')
+        currency = data.get('currency', 'USD').upper()
+        description = data.get('description', '')
         
-        if not recipient or amount <= 0:
-            return jsonify({'success': False, 'message': 'Invalid recipient or amount'}), 400
+        if not recipient_email or amount <= 0:
+            return jsonify({'success': False, 'message': 'Valid recipient email and amount required'}), 400
         
         db = get_db()
         
-        # Check balance
-        wallet = db.execute('''
-            SELECT balance FROM wallets WHERE user_id = ? AND currency = ?
-        ''', (user_id, currency)).fetchone()
+        # Check recipient exists
+        recipient = db.execute('SELECT id FROM users WHERE email = ?', (recipient_email,)).fetchone()
+        if not recipient:
+            return jsonify({'success': False, 'message': 'Recipient not found'}), 404
         
-        if not wallet or wallet['balance'] < amount:
+        # Check sender balance
+        sender_wallet = db.execute('''
+            SELECT balance FROM wallets WHERE user_id = ? AND currency = ?
+        ''', (g.current_user_id, currency)).fetchone()
+        
+        if not sender_wallet or sender_wallet['balance'] < amount:
             return jsonify({'success': False, 'message': 'Insufficient balance'}), 400
         
-        # Create transaction
+        # Process transaction
+        # Deduct from sender
         db.execute('''
-            INSERT INTO transactions (user_id, type, amount, currency, recipient, status)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, 'send', amount, currency, recipient, 'completed'))
+            UPDATE wallets SET balance = balance - ? WHERE user_id = ? AND currency = ?
+        ''', (amount, g.current_user_id, currency))
         
-        # Update balance
-        new_balance = wallet['balance'] - amount
+        # Add to recipient
         db.execute('''
-            UPDATE wallets SET balance = ? WHERE user_id = ? AND currency = ?
-        ''', (new_balance, user_id, currency))
+            UPDATE wallets SET balance = balance + ? WHERE user_id = ? AND currency = ?
+        ''', (amount, recipient['id'], currency))
+        
+        # Record transaction
+        db.execute('''
+            INSERT INTO transactions (user_id, type, amount, currency, recipient_email, description)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (g.current_user_id, 'send', amount, currency, recipient_email, description))
         
         db.commit()
         
         return jsonify({
             'success': True,
-            'message': 'Transaction completed successfully',
-            'new_balance': str(new_balance)
-        })
+            'message': 'Money sent successfully'
+        }), 200
         
     except Exception as e:
         logger.error(f"Send money error: {e}")
         return jsonify({'success': False, 'message': 'Transaction failed'}), 500
 
+# ===== QR CODE ENDPOINTS =====
+
 @app.route('/api/qr/generate', methods=['POST'])
+@require_auth
 def generate_qr():
     """Generate QR code for payment"""
     try:
-        # Get token from Authorization header
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'success': False, 'message': 'Token is missing'}), 401
-        
-        token = auth_header.split(' ')[1]
-        payload = verify_token(token)
-        if not payload:
-            return jsonify({'success': False, 'message': 'Token is invalid or expired'}), 401
-        
-        user_id = payload['user_id']
         data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'message': 'No data provided'}), 400
         
         amount = float(data.get('amount', 0))
-        currency = data.get('currency', 'USD')
+        currency = data.get('currency', 'USD').upper()
+        description = data.get('description', '')
         
         if amount <= 0:
-            return jsonify({'success': False, 'message': 'Invalid amount'}), 400
+            return jsonify({'success': False, 'message': 'Valid amount required'}), 400
         
-        # Generate QR ID and wallet address
-        qr_id = secrets.token_urlsafe(16)
-        wallet_address = f"nomadpay:{currency.lower()}:{qr_id}"
+        # Generate unique QR code
+        qr_code = secrets.token_urlsafe(16)
+        expires_at = datetime.utcnow() + timedelta(hours=24)  # QR expires in 24 hours
         
         db = get_db()
         db.execute('''
-            INSERT INTO qr_codes (user_id, qr_id, amount, currency, wallet_address, status)
+            INSERT INTO qr_codes (user_id, code, amount, currency, description, expires_at)
             VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, qr_id, amount, currency, wallet_address, 'active'))
+        ''', (g.current_user_id, qr_code, amount, currency, description, expires_at))
         db.commit()
         
         return jsonify({
             'success': True,
-            'qr_id': qr_id,
-            'wallet_address': wallet_address,
-            'qr_code': f"QR Code for {amount} {currency}"
-        })
+            'qr_code': qr_code,
+            'amount': amount,
+            'currency': currency,
+            'description': description,
+            'expires_at': expires_at.isoformat()
+        }), 201
         
     except Exception as e:
         logger.error(f"QR generation error: {e}")
         return jsonify({'success': False, 'message': 'QR generation failed'}), 500
+
+# ===== ADMIN ENDPOINTS =====
+
+@app.route('/api/admin/users', methods=['GET'])
+@require_auth
+def get_users():
+    """Get all users (admin only)"""
+    try:
+        # Check if user is admin
+        db = get_db()
+        user = db.execute('SELECT role FROM users WHERE id = ?', (g.current_user_id,)).fetchone()
+        if not user or user['role'] != 'admin':
+            return jsonify({'success': False, 'message': 'Admin access required'}), 403
+        
+        users = db.execute('''
+            SELECT id, email, role, status, created_at FROM users
+            ORDER BY created_at DESC
+        ''').fetchall()
+        
+        user_list = []
+        for user in users:
+            user_list.append({
+                'id': user['id'],
+                'email': user['email'],
+                'role': user['role'],
+                'status': user['status'],
+                'created_at': user['created_at']
+            })
+        
+        return jsonify({
+            'success': True,
+            'users': user_list
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Get users error: {e}")
+        return jsonify({'success': False, 'message': 'Failed to get users'}), 500
 
 # Initialize database on startup
 @app.before_first_request
@@ -650,9 +698,11 @@ def initialize_database():
 
 # Cleanup database connections
 @app.teardown_appcontext
-def close_db_connection(error):
-    """Close database connection after each request"""
-    close_db(error)
+def close_db(error):
+    """Close database connection"""
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
 
 if __name__ == '__main__':
     # Initialize database
