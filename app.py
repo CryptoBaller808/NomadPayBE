@@ -421,6 +421,227 @@ def login():
         logger.error(f"Login error: {e}")
         return jsonify({'success': False, 'message': 'Login failed. Please try again.'}), 500
 
+@app.route('/api/auth/refresh', methods=['POST'])
+@rate_limit(20)  # 20 refresh attempts per minute
+def refresh_token():
+    """Refresh access token"""
+    try:
+        data = request.get_json()
+        refresh_token = data.get('refresh_token', '')
+        
+        if not refresh_token:
+            return jsonify({'success': False, 'message': 'Refresh token is required'}), 400
+        
+        # Verify refresh token
+        payload = verify_token(refresh_token, 'refresh')
+        if not payload:
+            log_security_event('invalid_refresh_token', 'medium', details='Invalid refresh token')
+            return jsonify({'success': False, 'message': 'Invalid refresh token'}), 401
+        
+        user_id = payload['user_id']
+        
+        # Generate new tokens
+        tokens = generate_tokens(user_id)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Token refreshed successfully',
+            'access_token': tokens['access_token'],
+            'refresh_token': tokens['refresh_token']
+        })
+        
+    except Exception as e:
+        logger.error(f"Token refresh error: {e}")
+        return jsonify({'success': False, 'message': 'Token refresh failed'}), 500
+
+@app.route('/api/auth/logout', methods=['POST'])
+def logout():
+    """User logout"""
+    try:
+        # In a full implementation, you would revoke the refresh token
+        return jsonify({'success': True, 'message': 'Logout successful'})
+    except Exception as e:
+        logger.error(f"Logout error: {e}")
+        return jsonify({'success': False, 'message': 'Logout failed'}), 500
+
+# Wallet endpoints
+@app.route('/api/wallet/balances', methods=['GET'])
+def get_wallet_balances():
+    """Get user wallet balances"""
+    try:
+        # Get token from Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'success': False, 'message': 'Token is missing'}), 401
+        
+        token = auth_header.split(' ')[1]
+        payload = verify_token(token)
+        if not payload:
+            return jsonify({'success': False, 'message': 'Token is invalid or expired'}), 401
+        
+        user_id = payload['user_id']
+        db = get_db()
+        
+        wallets = db.execute('''
+            SELECT currency, balance FROM wallets WHERE user_id = ?
+        ''', (user_id,)).fetchall()
+        
+        wallet_data = [{'currency': w['currency'], 'balance': str(w['balance'])} for w in wallets]
+        
+        return jsonify({
+            'success': True,
+            'wallets': wallet_data
+        })
+        
+    except Exception as e:
+        logger.error(f"Wallet balances error: {e}")
+        return jsonify({'success': False, 'message': 'Failed to get wallet balances'}), 500
+
+@app.route('/api/transactions', methods=['GET'])
+def get_transactions():
+    """Get user transactions"""
+    try:
+        # Get token from Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'success': False, 'message': 'Token is missing'}), 401
+        
+        token = auth_header.split(' ')[1]
+        payload = verify_token(token)
+        if not payload:
+            return jsonify({'success': False, 'message': 'Token is invalid or expired'}), 401
+        
+        user_id = payload['user_id']
+        db = get_db()
+        
+        transactions = db.execute('''
+            SELECT id, type, amount, currency, recipient, status, created_at
+            FROM transactions WHERE user_id = ?
+            ORDER BY created_at DESC LIMIT 50
+        ''', (user_id,)).fetchall()
+        
+        transaction_data = [{
+            'id': str(t['id']),
+            'type': t['type'],
+            'amount': float(t['amount']),
+            'currency': t['currency'],
+            'recipient': t['recipient'],
+            'status': t['status'],
+            'created_at': t['created_at']
+        } for t in transactions]
+        
+        return jsonify({
+            'success': True,
+            'transactions': transaction_data
+        })
+        
+    except Exception as e:
+        logger.error(f"Transactions error: {e}")
+        return jsonify({'success': False, 'message': 'Failed to get transactions'}), 500
+
+@app.route('/api/transactions/send', methods=['POST'])
+def send_money():
+    """Send money transaction"""
+    try:
+        # Get token from Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'success': False, 'message': 'Token is missing'}), 401
+        
+        token = auth_header.split(' ')[1]
+        payload = verify_token(token)
+        if not payload:
+            return jsonify({'success': False, 'message': 'Token is invalid or expired'}), 401
+        
+        user_id = payload['user_id']
+        data = request.get_json()
+        
+        recipient = data.get('recipient', '')
+        amount = float(data.get('amount', 0))
+        currency = data.get('currency', 'USD')
+        
+        if not recipient or amount <= 0:
+            return jsonify({'success': False, 'message': 'Invalid recipient or amount'}), 400
+        
+        db = get_db()
+        
+        # Check balance
+        wallet = db.execute('''
+            SELECT balance FROM wallets WHERE user_id = ? AND currency = ?
+        ''', (user_id, currency)).fetchone()
+        
+        if not wallet or wallet['balance'] < amount:
+            return jsonify({'success': False, 'message': 'Insufficient balance'}), 400
+        
+        # Create transaction
+        db.execute('''
+            INSERT INTO transactions (user_id, type, amount, currency, recipient, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, 'send', amount, currency, recipient, 'completed'))
+        
+        # Update balance
+        new_balance = wallet['balance'] - amount
+        db.execute('''
+            UPDATE wallets SET balance = ? WHERE user_id = ? AND currency = ?
+        ''', (new_balance, user_id, currency))
+        
+        db.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Transaction completed successfully',
+            'new_balance': str(new_balance)
+        })
+        
+    except Exception as e:
+        logger.error(f"Send money error: {e}")
+        return jsonify({'success': False, 'message': 'Transaction failed'}), 500
+
+@app.route('/api/qr/generate', methods=['POST'])
+def generate_qr():
+    """Generate QR code for payment"""
+    try:
+        # Get token from Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'success': False, 'message': 'Token is missing'}), 401
+        
+        token = auth_header.split(' ')[1]
+        payload = verify_token(token)
+        if not payload:
+            return jsonify({'success': False, 'message': 'Token is invalid or expired'}), 401
+        
+        user_id = payload['user_id']
+        data = request.get_json()
+        
+        amount = float(data.get('amount', 0))
+        currency = data.get('currency', 'USD')
+        
+        if amount <= 0:
+            return jsonify({'success': False, 'message': 'Invalid amount'}), 400
+        
+        # Generate QR ID and wallet address
+        qr_id = secrets.token_urlsafe(16)
+        wallet_address = f"nomadpay:{currency.lower()}:{qr_id}"
+        
+        db = get_db()
+        db.execute('''
+            INSERT INTO qr_codes (user_id, qr_id, amount, currency, wallet_address, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, qr_id, amount, currency, wallet_address, 'active'))
+        db.commit()
+        
+        return jsonify({
+            'success': True,
+            'qr_id': qr_id,
+            'wallet_address': wallet_address,
+            'qr_code': f"QR Code for {amount} {currency}"
+        })
+        
+    except Exception as e:
+        logger.error(f"QR generation error: {e}")
+        return jsonify({'success': False, 'message': 'QR generation failed'}), 500
+
 # Initialize database on startup
 @app.before_first_request
 def initialize_database():
