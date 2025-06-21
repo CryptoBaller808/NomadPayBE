@@ -338,4 +338,4 @@ class AuthController:
                 'success': False,
                 'message': 'Logout failed'
             }), 500
-
+            
